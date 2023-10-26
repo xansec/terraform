@@ -1,0 +1,12 @@
+project: xansec/terraform
+target: plan 
+image: ghcr.io/xansec/terraform 
+
+advanced_triage: false 
+
+cmds:
+  - cmd: terraform plan
+    env: {}
+    cwd: /workspace
+    filepath: /workspace/main.tf 
+
