@@ -8,9 +8,7 @@ import (
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/addrs"
-	"github.com/hashicorp/terraform/internal/backend"
-	"github.com/hashicorp/terraform/internal/configs"
-	"github.com/hashicorp/terraform/internal/lang"
+	"github.com/hashicorp/terraform/internal/lang/langrefs"
 )
 
 var _ hcl.Body = (*ProviderConfig)(nil)
@@ -23,11 +21,14 @@ var _ hcl.Body = (*ProviderConfig)(nil)
 // framework, so they should only use variables available to the test framework
 // but are instead initialised within the Terraform graph so we have to delay
 // evaluation of their attributes until the schemas are retrieved.
+//
+// We don't parse the attributes until they are requested, so we can only use
+// unparsed values and hcl.Expressions within the struct itself.
 type ProviderConfig struct {
 	Original hcl.Body
 
-	ConfigVariables    map[string]*configs.Variable
-	AvailableVariables map[string]backend.UnparsedVariableValue
+	VariableCache       *VariableCache
+	AvailableRunOutputs map[addrs.Run]cty.Value
 }
 
 func (p *ProviderConfig) Content(schema *hcl.BodySchema) (*hcl.BodyContent, hcl.Diagnostics) {
@@ -51,7 +52,7 @@ func (p *ProviderConfig) PartialContent(schema *hcl.BodySchema) (*hcl.BodyConten
 		Attributes:       attrs,
 		Blocks:           p.transformBlocks(content.Blocks),
 		MissingItemRange: content.MissingItemRange,
-	}, &ProviderConfig{rest, p.ConfigVariables, p.AvailableVariables}, diags
+	}, &ProviderConfig{rest, p.VariableCache, p.AvailableRunOutputs}, diags
 }
 
 func (p *ProviderConfig) JustAttributes() (hcl.Attributes, hcl.Diagnostics) {
@@ -67,38 +68,41 @@ func (p *ProviderConfig) MissingItemRange() hcl.Range {
 func (p *ProviderConfig) transformAttributes(originals hcl.Attributes) (hcl.Attributes, hcl.Diagnostics) {
 	var diags hcl.Diagnostics
 
-	relevantVariables := make(map[string]cty.Value)
-	var exprs []hcl.Expression
+	availableVariables := make(map[string]cty.Value)
 
+	exprs := make(map[string]hcl.Expression, len(originals))
 	for _, original := range originals {
-		exprs = append(exprs, original.Expr)
+		exprs[original.Name] = original.Expr
 
-		// We revalidate this later, so we actually only care about the
-		// references we can extract.
-		refs, _ := lang.ReferencesInExpr(addrs.ParseRefFromTestingScope, original.Expr)
+		// We also need to parse the variables we're going to use, so we extract
+		// the references from this expression now and see if they reference any
+		// input variables. If we find an input variable, we'll copy it into
+		// our availableVariables local.
+		refs, _ := langrefs.ReferencesInExpr(addrs.ParseRefFromTestingScope, original.Expr)
 		for _, ref := range refs {
 			if addr, ok := ref.Subject.(addrs.InputVariable); ok {
-				if variable, exists := p.AvailableVariables[addr.Name]; exists {
+				value, valueDiags := p.VariableCache.GetFileVariable(addr.Name)
+				diags = append(diags, valueDiags.ToHCL()...)
+				if value != nil {
+					availableVariables[addr.Name] = value.Value
+					continue
+				}
 
-					parsingMode := configs.VariableParseHCL
-					if config, exists := p.ConfigVariables[addr.Name]; exists {
-						parsingMode = config.ParsingMode
-					}
-
-					value, valueDiags := variable.ParseVariableValue(parsingMode)
-					diags = append(diags, valueDiags.ToHCL()...)
-					if value != nil {
-						relevantVariables[addr.Name] = value.Value
-					}
+				// If the variable wasn't a file variable, it might be a global.
+				value, valueDiags = p.VariableCache.GetGlobalVariable(addr.Name)
+				diags = append(diags, valueDiags.ToHCL()...)
+				if value != nil {
+					availableVariables[addr.Name] = value.Value
+					continue
 				}
 			}
 		}
 	}
 
-	ctx, ctxDiags := EvalContext(exprs, relevantVariables, nil)
+	ctx, ctxDiags := EvalContext(TargetProvider, exprs, availableVariables, p.AvailableRunOutputs)
 	diags = append(diags, ctxDiags.ToHCL()...)
 	if ctxDiags.HasErrors() {
-		return originals, diags
+		return nil, diags
 	}
 
 	attrs := make(hcl.Attributes, len(originals))
@@ -106,7 +110,7 @@ func (p *ProviderConfig) transformAttributes(originals hcl.Attributes) (hcl.Attr
 		value, valueDiags := attr.Expr.Value(ctx)
 		diags = append(diags, valueDiags...)
 		if valueDiags.HasErrors() {
-			attrs[name] = attr
+			continue
 		} else {
 			attrs[name] = &hcl.Attribute{
 				Name:      name,
@@ -125,7 +129,7 @@ func (p *ProviderConfig) transformBlocks(originals hcl.Blocks) hcl.Blocks {
 		blocks[name] = &hcl.Block{
 			Type:        block.Type,
 			Labels:      block.Labels,
-			Body:        &ProviderConfig{block.Body, p.ConfigVariables, p.AvailableVariables},
+			Body:        &ProviderConfig{block.Body, p.VariableCache, p.AvailableRunOutputs},
 			DefRange:    block.DefRange,
 			TypeRange:   block.TypeRange,
 			LabelRanges: block.LabelRanges,

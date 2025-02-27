@@ -9,9 +9,10 @@ import (
 	"fmt"
 	"os"
 	"regexp"
-	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
@@ -19,13 +20,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	awsbase "github.com/hashicorp/aws-sdk-go-base/v2"
 	baselogging "github.com/hashicorp/aws-sdk-go-base/v2/logging"
+	"github.com/hashicorp/aws-sdk-go-base/v2/validation"
+	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/gocty"
+
 	"github.com/hashicorp/terraform/internal/backend"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 	"github.com/hashicorp/terraform/version"
-	"github.com/zclconf/go-cty/cty"
-	"github.com/zclconf/go-cty/cty/gocty"
-	"golang.org/x/exp/maps"
 )
 
 func New() backend.Backend {
@@ -44,6 +46,7 @@ type Backend struct {
 	acl                   string
 	kmsKeyID              string
 	ddbTable              string
+	useLockFile           bool
 	workspaceKeyPrefix    string
 	skipS3Checksum        bool
 }
@@ -149,6 +152,12 @@ func (b *Backend) ConfigSchema() *configschema.Block {
 				Type:        cty.String,
 				Optional:    true,
 				Description: "DynamoDB table for state locking and consistency",
+				Deprecated:  true,
+			},
+			"use_lockfile": {
+				Type:        cty.Bool,
+				Optional:    true,
+				Description: "Whether to use a lockfile for locking the state file.",
 			},
 			"profile": {
 				Type:        cty.String,
@@ -212,59 +221,6 @@ func (b *Backend) ConfigSchema() *configschema.Block {
 				Description: "The base64-encoded encryption key to use for server-side encryption with customer-provided keys (SSE-C).",
 				Sensitive:   true,
 			},
-			"role_arn": {
-				Type:        cty.String,
-				Optional:    true,
-				Description: "The role to be assumed",
-				Deprecated:  true,
-			},
-			"session_name": {
-				Type:        cty.String,
-				Optional:    true,
-				Description: "The session name to use when assuming the role.",
-				Deprecated:  true,
-			},
-			"external_id": {
-				Type:        cty.String,
-				Optional:    true,
-				Description: "The external ID to use when assuming the role",
-				Deprecated:  true,
-			},
-
-			"assume_role_duration_seconds": {
-				Type:        cty.Number,
-				Optional:    true,
-				Description: "Seconds to restrict the assume role session duration.",
-				Deprecated:  true,
-			},
-
-			"assume_role_policy": {
-				Type:        cty.String,
-				Optional:    true,
-				Description: "IAM Policy JSON describing further restricting permissions for the IAM Role being assumed.",
-				Deprecated:  true,
-			},
-
-			"assume_role_policy_arns": {
-				Type:        cty.Set(cty.String),
-				Optional:    true,
-				Description: "Amazon Resource Names (ARNs) of IAM Policies describing further restricting permissions for the IAM Role being assumed.",
-				Deprecated:  true,
-			},
-
-			"assume_role_tags": {
-				Type:        cty.Map(cty.String),
-				Optional:    true,
-				Description: "Assume role session tags.",
-				Deprecated:  true,
-			},
-
-			"assume_role_transitive_tag_keys": {
-				Type:        cty.Set(cty.String),
-				Optional:    true,
-				Description: "Assume role session tag keys to pass to any subsequent sessions.",
-				Deprecated:  true,
-			},
 
 			"workspace_key_prefix": {
 				Type:        cty.String,
@@ -295,12 +251,6 @@ func (b *Backend) ConfigSchema() *configschema.Block {
 
 			"assume_role_with_web_identity": assumeRoleWithWebIdentitySchema.SchemaAttribute(),
 
-			"use_legacy_workflow": {
-				Type:        cty.Bool,
-				Optional:    true,
-				Description: "Use the legacy authentication workflow, preferring environment variables over backend configuration.",
-			},
-
 			"custom_ca_bundle": {
 				Type:        cty.String,
 				Optional:    true,
@@ -310,8 +260,21 @@ func (b *Backend) ConfigSchema() *configschema.Block {
 			"http_proxy": {
 				Type:        cty.String,
 				Optional:    true,
-				Description: "Address of an HTTP proxy to use when accessing the AWS API.",
+				Description: "URL of a proxy to use for HTTP requests when accessing the AWS API.",
 			},
+
+			"https_proxy": {
+				Type:        cty.String,
+				Optional:    true,
+				Description: "URL of a proxy to use for HTTPS requests when accessing the AWS API.",
+			},
+
+			"no_proxy": {
+				Type:        cty.String,
+				Optional:    true,
+				Description: "Comma-separated list of hosts that should not use HTTP or HTTPS proxies.",
+			},
+
 			"insecure": {
 				Type:        cty.Bool,
 				Optional:    true,
@@ -341,6 +304,7 @@ var assumeRoleSchema = singleNestedAttribute{
 			},
 			validateString{
 				Validators: []stringValidator{
+					validateStringNotEmpty,
 					validateARN(
 						validateIAMRoleARN,
 					),
@@ -463,6 +427,7 @@ var assumeRoleWithWebIdentitySchema = singleNestedAttribute{
 			},
 			validateString{
 				Validators: []stringValidator{
+					validateStringNotEmpty,
 					validateARN(
 						validateIAMRoleARN,
 					),
@@ -570,6 +535,7 @@ var endpointsSchema = singleNestedAttribute{
 				Type:        cty.String,
 				Optional:    true,
 				Description: "A custom endpoint for the DynamoDB API",
+				Deprecated:  true,
 			},
 			validateString{
 				Validators: []stringValidator{
@@ -600,6 +566,19 @@ var endpointsSchema = singleNestedAttribute{
 			validateString{
 				Validators: []stringValidator{
 					validateStringLegacyURL,
+				},
+			},
+		},
+
+		"sso": stringAttribute{
+			configschema.Attribute{
+				Type:        cty.String,
+				Optional:    true,
+				Description: "A custom endpoint for the IAM Identity Center (formerly known as SSO) API",
+			},
+			validateString{
+				Validators: []stringValidator{
+					validateStringValidURL,
 				},
 			},
 		},
@@ -694,36 +673,8 @@ func (b *Backend) PrepareConfig(obj cty.Value) (cty.Value, tfdiags.Diagnostics) 
 		keyPrefixValidators.ValidateAttr(val, attrPath, &diags)
 	}
 
-	var assumeRoleDeprecatedFields = map[string]string{
-		"role_arn":                        "assume_role.role_arn",
-		"session_name":                    "assume_role.session_name",
-		"external_id":                     "assume_role.external_id",
-		"assume_role_duration_seconds":    "assume_role.duration",
-		"assume_role_policy":              "assume_role.policy",
-		"assume_role_policy_arns":         "assume_role.policy_arns",
-		"assume_role_tags":                "assume_role.tags",
-		"assume_role_transitive_tag_keys": "assume_role.transitive_tag_keys",
-	}
-
 	if val := obj.GetAttr("assume_role"); !val.IsNull() {
 		validateNestedAttribute(assumeRoleSchema, val, cty.GetAttrPath("assume_role"), &diags)
-
-		if defined := findDeprecatedFields(obj, assumeRoleDeprecatedFields); len(defined) != 0 {
-			diags = diags.Append(tfdiags.WholeContainingBody(
-				tfdiags.Error,
-				"Conflicting Parameters",
-				`The following deprecated parameters conflict with the parameter "assume_role". Replace them as follows:`+"\n"+
-					formatDeprecations(defined),
-			))
-		}
-	} else {
-		if defined := findDeprecatedFields(obj, assumeRoleDeprecatedFields); len(defined) != 0 {
-			diags = diags.Append(wholeBodyWarningDiag(
-				"Deprecated Parameters",
-				`The following parameters have been deprecated. Replace them as follows:`+"\n"+
-					formatDeprecations(defined),
-			))
-		}
 	}
 
 	if val := obj.GetAttr("assume_role_with_web_identity"); !val.IsNull() {
@@ -738,6 +689,11 @@ func (b *Backend) PrepareConfig(obj cty.Value) (cty.Value, tfdiags.Diagnostics) 
 	attrPath = cty.GetAttrPath("shared_credentials_file")
 	if val := obj.GetAttr("shared_credentials_file"); !val.IsNull() {
 		diags = diags.Append(deprecatedAttrDiag(attrPath, cty.GetAttrPath("shared_credentials_files")))
+	}
+
+	attrPath = cty.GetAttrPath("dynamodb_table")
+	if val := obj.GetAttr("dynamodb_table"); !val.IsNull() {
+		diags = diags.Append(deprecatedAttrDiag(attrPath, cty.GetAttrPath("use_lockfile")))
 	}
 
 	endpointFields := map[string]string{
@@ -778,7 +734,7 @@ func (b *Backend) PrepareConfig(obj cty.Value) (cty.Value, tfdiags.Diagnostics) 
 			validateStringLegacyURL,
 		},
 	}
-	for _, k := range maps.Keys(endpointFields) {
+	for k := range endpointFields {
 		if val := obj.GetAttr(k); !val.IsNull() {
 			attrPath := cty.GetAttrPath(k)
 			endpointValidators.ValidateAttr(val, attrPath, &diags)
@@ -833,36 +789,6 @@ func (b *Backend) PrepareConfig(obj cty.Value) (cty.Value, tfdiags.Diagnostics) 
 	return obj, diags
 }
 
-func findDeprecatedFields(obj cty.Value, attrs map[string]string) map[string]string {
-	defined := make(map[string]string)
-	for attr, v := range attrs {
-		if val := obj.GetAttr(attr); !val.IsNull() {
-			defined[attr] = v
-		}
-	}
-	return defined
-}
-
-func formatDeprecations(attrs map[string]string) string {
-	names := make([]string, 0, len(attrs))
-	var maxLen int
-	for attr := range attrs {
-		names = append(names, attr)
-		if l := len(attr); l > maxLen {
-			maxLen = l
-		}
-	}
-	sort.Strings(names)
-
-	var buf strings.Builder
-
-	for _, attr := range names {
-		replacement := attrs[attr]
-		fmt.Fprintf(&buf, "  * %-[1]*[2]s -> %[3]s\n", maxLen, attr, replacement)
-	}
-	return buf.String()
-}
-
 // Configure uses the provided configuration to set configuration fields
 // within the backend.
 //
@@ -885,11 +811,11 @@ func (b *Backend) Configure(obj cty.Value) tfdiags.Diagnostics {
 	}
 
 	if region != "" && !boolAttr(obj, "skip_region_validation") {
-		if err := awsbase.ValidateRegion(region); err != nil {
+		if err := validation.SupportedRegion(region); err != nil {
 			diags = diags.Append(tfdiags.AttributeValue(
 				tfdiags.Error,
 				"Invalid region value",
-				err.Error(),
+				firstToUpper(err.Error()),
 				cty.GetAttrPath("region"),
 			))
 			return diags
@@ -905,10 +831,11 @@ func (b *Backend) Configure(obj cty.Value) tfdiags.Diagnostics {
 	)
 
 	b.acl = stringAttr(obj, "acl")
-	b.workspaceKeyPrefix = stringAttrDefault(obj, "workspace_key_prefix", "env:")
+	b.workspaceKeyPrefix = stringAttrDefault(obj, "workspace_key_prefix", defaultWorkspaceKeyPrefix)
 	b.serverSideEncryption = boolAttr(obj, "encrypt")
 	b.kmsKeyID = stringAttr(obj, "kms_key_id")
 	b.ddbTable = stringAttr(obj, "dynamodb_table")
+	b.useLockFile = boolAttr(obj, "use_lockfile")
 	b.skipS3Checksum = boolAttr(obj, "skip_s3_checksum")
 
 	if _, ok := stringAttrOk(obj, "kms_key_id"); ok {
@@ -981,23 +908,12 @@ func (b *Backend) Configure(obj cty.Value) tfdiags.Diagnostics {
 		Logger:                  baselog,
 		MaxRetries:              intAttrDefault(obj, "max_retries", 5),
 		Profile:                 stringAttr(obj, "profile"),
+		HTTPProxyMode:           awsbase.HTTPProxyModeLegacy,
 		Region:                  stringAttr(obj, "region"),
 		SecretKey:               stringAttr(obj, "secret_key"),
 		SkipCredsValidation:     boolAttr(obj, "skip_credentials_validation"),
 		SkipRequestingAccountId: boolAttr(obj, "skip_requesting_account_id"),
 		Token:                   stringAttr(obj, "token"),
-	}
-
-	// The "legacy" authentication workflow used in aws-sdk-go-base V1 will be
-	// gradually phased out over several Terraform minor versions:
-	//
-	// 1.6 - Default to `true` (prefer existing behavior, "opt-out" for new behavior)
-	// 1.7 - Default to `false` (prefer new behavior, "opt-in" for legacy behavior)
-	// 1.8 - Remove argument, legacy workflow no longer supported
-	if val, ok := boolAttrOk(obj, "use_legacy_workflow"); ok {
-		cfg.UseLegacyWorkflow = val
-	} else {
-		cfg.UseLegacyWorkflow = true
 	}
 
 	if val, ok := boolAttrOk(obj, "skip_metadata_api_check"); ok {
@@ -1052,6 +968,13 @@ func (b *Backend) Configure(obj cty.Value) tfdiags.Diagnostics {
 	}
 
 	if v, ok := retrieveArgument(&diags,
+		newAttributeRetriever(obj, cty.GetAttrPath("endpoints").GetAttr("sso")),
+		newEnvvarRetriever("AWS_ENDPOINT_URL_SSO"),
+	); ok {
+		cfg.SsoEndpoint = v
+	}
+
+	if v, ok := retrieveArgument(&diags,
 		newAttributeRetriever(obj, cty.GetAttrPath("endpoints").GetAttr("sts")),
 		newAttributeRetriever(obj, cty.GetAttrPath("sts_endpoint")),
 		newEnvvarRetriever("AWS_ENDPOINT_URL_STS"),
@@ -1065,7 +988,7 @@ func (b *Backend) Configure(obj cty.Value) tfdiags.Diagnostics {
 	}
 
 	if assumeRole := obj.GetAttr("assume_role"); !assumeRole.IsNull() {
-		ar := &awsbase.AssumeRole{}
+		ar := awsbase.AssumeRole{}
 		if val, ok := stringAttrOk(assumeRole, "role_arn"); ok {
 			ar.RoleARN = val
 		}
@@ -1094,28 +1017,7 @@ func (b *Backend) Configure(obj cty.Value) tfdiags.Diagnostics {
 		if val, ok := stringSetAttrOk(assumeRole, "transitive_tag_keys"); ok {
 			ar.TransitiveTagKeys = val
 		}
-		cfg.AssumeRole = ar
-	} else if arn, ok := stringAttrOk(obj, "role_arn"); ok {
-		ar := &awsbase.AssumeRole{}
-		ar.RoleARN = arn
-		ar.SessionName = stringAttr(obj, "session_name")
-		ar.Duration = time.Duration(intAttr(obj, "assume_role_duration_seconds")) * time.Second
-		ar.ExternalID = stringAttr(obj, "external_id")
-		if val, ok := stringAttrOk(obj, "assume_role_policy"); ok {
-			ar.Policy = strings.TrimSpace(val)
-		}
-		if val, ok := stringSetAttrOk(obj, "assume_role_policy_arns"); ok {
-			ar.PolicyARNs = val
-		}
-
-		if val, ok := stringMapAttrOk(obj, "assume_role_tags"); ok {
-			ar.Tags = val
-		}
-
-		if val, ok := stringSetAttrOk(obj, "assume_role_transitive_tag_keys"); ok {
-			ar.TransitiveTagKeys = val
-		}
-		cfg.AssumeRole = ar
+		cfg.AssumeRole = []awsbase.AssumeRole{ar}
 	}
 
 	if assumeRoleWithWebIdentity := obj.GetAttr("assume_role_with_web_identity"); !assumeRoleWithWebIdentity.IsNull() {
@@ -1147,11 +1049,18 @@ func (b *Backend) Configure(obj cty.Value) tfdiags.Diagnostics {
 
 	if v, ok := retrieveArgument(&diags,
 		newAttributeRetriever(obj, cty.GetAttrPath("http_proxy")),
-		newEnvvarRetriever("HTTP_PROXY"),
-		newEnvvarRetriever("HTTPS_PROXY"),
 	); ok {
-		cfg.HTTPProxy = v
+		cfg.HTTPProxy = aws.String(v)
 	}
+	if v, ok := retrieveArgument(&diags,
+		newAttributeRetriever(obj, cty.GetAttrPath("https_proxy")),
+	); ok {
+		cfg.HTTPSProxy = aws.String(v)
+	}
+	if val, ok := stringAttrOk(obj, "no_proxy"); ok {
+		cfg.NoProxy = val
+	}
+
 	if val, ok := boolAttrOk(obj, "insecure"); ok {
 		cfg.Insecure = val
 	}
@@ -1486,6 +1395,13 @@ func validateNestedAttribute(objSchema schemaAttribute, obj cty.Value, objPath c
 		attrPath := objPath.GetAttr(name)
 		attrVal := obj.GetAttr(name)
 
+		if attrVal.IsNull() {
+			if attrSchema.SchemaAttribute().Required {
+				*diags = diags.Append(requiredAttributeErrDiag(attrPath))
+			}
+			continue
+		}
+
 		if a, e := attrVal.Type(), attrSchema.SchemaAttribute().Type; a != e {
 			*diags = diags.Append(attributeErrDiag(
 				"Internal Error",
@@ -1690,4 +1606,16 @@ func deprecatedEnvVarDiag(envvar, replacement string) tfdiags.Diagnostic {
 		"Deprecated Environment Variable",
 		fmt.Sprintf(`The environment variable "%s" is deprecated. Use environment variable "%s" instead.`, envvar, replacement),
 	)
+}
+
+func firstToUpper(s string) string {
+	r, size := utf8.DecodeRuneInString(s)
+	if r == utf8.RuneError && size <= 1 {
+		return s
+	}
+	lc := unicode.ToUpper(r)
+	if r == lc {
+		return s
+	}
+	return string(lc) + s[size:]
 }

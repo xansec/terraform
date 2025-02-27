@@ -7,19 +7,22 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/hashicorp/go-tfe"
 	tfaddr "github.com/hashicorp/terraform-registry-address"
+	svchost "github.com/hashicorp/terraform-svchost"
 	"github.com/hashicorp/terraform-svchost/disco"
 	"github.com/zclconf/go-cty/cty"
 
-	"github.com/hashicorp/terraform/internal/backend"
+	"github.com/hashicorp/terraform/internal/backend/backendrun"
 	"github.com/hashicorp/terraform/internal/command/format"
 	"github.com/hashicorp/terraform/internal/command/jsonformat"
 	"github.com/hashicorp/terraform/internal/command/views"
@@ -58,7 +61,7 @@ type TestSuiteRunner struct {
 
 	// GlobalVariables are the variables provided by the TF_VAR_* environment
 	// variables and -var and -var-file flags.
-	GlobalVariables map[string]backend.UnparsedVariableValue
+	GlobalVariables map[string]backendrun.UnparsedVariableValue
 
 	// Stopped and Cancelled track whether the user requested the testing
 	// process to be interrupted. Stopped is a nice graceful exit, we'll still
@@ -79,6 +82,10 @@ type TestSuiteRunner struct {
 	// Verbose tells the runner to print out plan files during each test run.
 	Verbose bool
 
+	// OperationParallelism is the limit Terraform places on total parallel operations
+	// during the plan or apply command within a single test run.
+	OperationParallelism int
+
 	// Filters restricts which test files will be executed.
 	Filters []string
 
@@ -93,6 +100,10 @@ type TestSuiteRunner struct {
 	View    views.Test
 	Streams *terminal.Streams
 
+	// appName is the name of the instance this test suite runner is configured
+	// against. Can be "HCP Terraform" or "Terraform Enterprise"
+	appName string
+
 	// clientOverride allows tests to specify the client instead of letting the
 	// system initialise one itself.
 	clientOverride *tfe.Client
@@ -100,6 +111,10 @@ type TestSuiteRunner struct {
 
 func (runner *TestSuiteRunner) Stop() {
 	runner.Stopped = true
+}
+
+func (runner *TestSuiteRunner) IsStopped() bool {
+	return runner.Stopped
 }
 
 func (runner *TestSuiteRunner) Cancel() {
@@ -142,7 +157,7 @@ func (runner *TestSuiteRunner) Test() (moduletest.Status, tfdiags.Diagnostics) {
 		diags = diags.Append(tfdiags.AttributeValue(
 			tfdiags.Error,
 			"Module source points to the public registry",
-			"Terraform Cloud can only execute tests for modules held within private registries.",
+			"HCP Terraform and Terraform Enterprise can only execute tests for modules held within private registries.",
 			cty.Path{cty.GetAttrStep{Name: "source"}}))
 		return moduletest.Error, diags
 	}
@@ -163,7 +178,7 @@ func (runner *TestSuiteRunner) Test() (moduletest.Status, tfdiags.Diagnostics) {
 
 	configurationVersion, err := client.ConfigurationVersions.CreateForRegistryModule(runner.StoppedCtx, id)
 	if err != nil {
-		diags = diags.Append(generalError("Failed to create configuration version", err))
+		diags = diags.Append(runner.generalError("Failed to create configuration version", err))
 		return moduletest.Error, diags
 	}
 
@@ -172,7 +187,7 @@ func (runner *TestSuiteRunner) Test() (moduletest.Status, tfdiags.Diagnostics) {
 	}
 
 	if err := client.ConfigurationVersions.Upload(runner.StoppedCtx, configurationVersion.UploadURL, configDirectory); err != nil {
-		diags = diags.Append(generalError("Failed to upload configuration version", err))
+		diags = diags.Append(runner.generalError("Failed to upload configuration version", err))
 		return moduletest.Error, diags
 	}
 
@@ -185,14 +200,15 @@ func (runner *TestSuiteRunner) Test() (moduletest.Status, tfdiags.Diagnostics) {
 	// the test run tidies up any state properly. This means, we'll send the
 	// cancellation signals and then still wait for and process the logs.
 	//
-	// This also means that all calls to TFC will use context.Background()
+	// This also means that all calls to HCP Terraform will use context.Background()
 	// instead of the stopped or cancelled context as we want them to finish and
-	// the run to be cancelled by TFC properly.
+	// the run to be cancelled by HCP Terraform properly.
 
 	opts := tfe.TestRunCreateOptions{
 		Filters:       runner.Filters,
 		TestDirectory: tfe.String(runner.TestingDirectory),
 		Verbose:       tfe.Bool(runner.Verbose),
+		Parallelism:   tfe.Int(runner.OperationParallelism),
 		Variables: func() []*tfe.RunVariable {
 			runVariables := make([]*tfe.RunVariable, 0, len(variables))
 			for name, value := range variables {
@@ -209,7 +225,7 @@ func (runner *TestSuiteRunner) Test() (moduletest.Status, tfdiags.Diagnostics) {
 
 	run, err := client.TestRuns.Create(context.Background(), opts)
 	if err != nil {
-		diags = diags.Append(generalError("Failed to create test run", err))
+		diags = diags.Append(runner.generalError("Failed to create test run", err))
 		return moduletest.Error, diags
 	}
 
@@ -228,7 +244,7 @@ func (runner *TestSuiteRunner) Test() (moduletest.Status, tfdiags.Diagnostics) {
 		for i := 0; !completed; i++ {
 			run, err := client.TestRuns.Read(context.Background(), id, run.ID)
 			if err != nil {
-				diags = diags.Append(generalError("Failed to retrieve test run", err))
+				diags = diags.Append(runner.generalError("Failed to retrieve test run", err))
 				return // exit early
 			}
 
@@ -270,7 +286,7 @@ func (runner *TestSuiteRunner) Test() (moduletest.Status, tfdiags.Diagnostics) {
 	// Refresh the run now we know it is finished.
 	run, err = client.TestRuns.Read(context.Background(), id, run.ID)
 	if err != nil {
-		diags = diags.Append(generalError("Failed to retrieve completed test run", err))
+		diags = diags.Append(runner.generalError("Failed to retrieve completed test run", err))
 		return moduletest.Error, diags
 	}
 
@@ -302,6 +318,24 @@ func (runner *TestSuiteRunner) Test() (moduletest.Status, tfdiags.Diagnostics) {
 	}
 }
 
+// discover the TFC/E API service URL
+func discoverTfeURL(hostname svchost.Hostname, services *disco.Disco) (*url.URL, error) {
+	host, err := services.Discover(hostname)
+	if err != nil {
+		var serviceDiscoErr *disco.ErrServiceDiscoveryNetworkRequest
+
+		switch {
+		case errors.As(err, &serviceDiscoErr):
+			err = fmt.Errorf("a network issue prevented cloud configuration; %w", err)
+			return nil, err
+		default:
+			return nil, err
+		}
+	}
+
+	return host.ServiceURL(tfeServiceID)
+}
+
 func (runner *TestSuiteRunner) client(addr tfaddr.Module, id tfe.RegistryModuleID) (*tfe.Client, *tfe.RegistryModule, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
@@ -309,7 +343,7 @@ func (runner *TestSuiteRunner) client(addr tfaddr.Module, id tfe.RegistryModuleI
 	if runner.clientOverride != nil {
 		client = runner.clientOverride
 	} else {
-		service, err := discover(addr.Package.Host, runner.Services)
+		service, err := discoverTfeURL(addr.Package.Host, runner.Services)
 		if err != nil {
 			diags = diags.Append(tfdiags.AttributeValue(
 				tfdiags.Error,
@@ -365,10 +399,10 @@ func (runner *TestSuiteRunner) client(addr tfaddr.Module, id tfe.RegistryModuleI
 		if client, err = tfe.NewClient(cfg); err != nil {
 			diags = diags.Append(tfdiags.Sourceless(
 				tfdiags.Error,
-				"Failed to create the Terraform Cloud/Enterprise client",
+				"Failed to create the HCP Terraform or Terraform Enterprise client",
 				fmt.Sprintf(
 					`Encountered an unexpected error while creating the `+
-						`Terraform Cloud/Enterprise client: %s.`, err,
+						`HCP Terraform or Terraform Enterprise client: %s.`, err,
 				),
 			))
 			return nil, nil, diags
@@ -392,6 +426,11 @@ func (runner *TestSuiteRunner) client(addr tfaddr.Module, id tfe.RegistryModuleI
 	// Enable retries for server errors.
 	client.RetryServerErrors(true)
 
+	runner.appName = client.AppName()
+	if isValidAppName(runner.appName) {
+		runner.appName = "HCP Terraform"
+	}
+
 	// Aaaaand I'm done.
 	return client, module, diags
 }
@@ -404,13 +443,13 @@ func (runner *TestSuiteRunner) wait(ctx context.Context, client *tfe.Client, run
 			diags = diags.Append(tfdiags.Sourceless(
 				tfdiags.Error,
 				"Could not cancel the test run",
-				fmt.Sprintf("Terraform could not cancel the test run, you will have to navigate to the Terraform Cloud console and cancel the test run manually.\n\nThe error message received when cancelling the test run was %s", err)))
+				fmt.Sprintf("Terraform could not cancel the test run, you will have to navigate to the %s console and cancel the test run manually.\n\nThe error message received when cancelling the test run was %s", client.AppName(), err)))
 			return
 		}
 
 		// At this point we've requested a force cancel, and we know that
 		// Terraform locally is just going to quit after some amount of time so
-		// we'll just wait for that to happen or for TFC to finish, whichever
+		// we'll just wait for that to happen or for HCP Terraform to finish, whichever
 		// happens first.
 		<-ctx.Done()
 	}
@@ -420,11 +459,11 @@ func (runner *TestSuiteRunner) wait(ctx context.Context, client *tfe.Client, run
 			diags = diags.Append(tfdiags.Sourceless(
 				tfdiags.Error,
 				"Could not stop the test run",
-				fmt.Sprintf("Terraform could not stop the test run, you will have to navigate to the Terraform Cloud console and cancel the test run manually.\n\nThe error message received when stopping the test run was %s", err)))
+				fmt.Sprintf("Terraform could not stop the test run, you will have to navigate to the %s console and cancel the test run manually.\n\nThe error message received when stopping the test run was %s", client.AppName(), err)))
 			return
 		}
 
-		// We've request a cancel, we're happy to just wait for TFC to cancel
+		// We've request a cancel, we're happy to just wait for HCP Terraform to cancel
 		// the run appropriately.
 		select {
 		case <-runner.CancelledCtx.Done():
@@ -453,7 +492,7 @@ func (runner *TestSuiteRunner) renderLogs(client *tfe.Client, run *tfe.TestRun, 
 
 	logs, err := client.TestRuns.Logs(context.Background(), moduleId, run.ID)
 	if err != nil {
-		diags = diags.Append(generalError("Failed to retrieve logs", err))
+		diags = diags.Append(runner.generalError("Failed to retrieve logs", err))
 		return diags
 	}
 
@@ -467,7 +506,7 @@ func (runner *TestSuiteRunner) renderLogs(client *tfe.Client, run *tfe.TestRun, 
 			l, isPrefix, err = reader.ReadLine()
 			if err != nil {
 				if err != io.EOF {
-					diags = diags.Append(generalError("Failed to read logs", err))
+					diags = diags.Append(runner.generalError("Failed to read logs", err))
 					return diags
 				}
 				next = false
@@ -570,4 +609,36 @@ func (runner *TestSuiteRunner) renderLogs(client *tfe.Client, run *tfe.TestRun, 
 	}
 
 	return diags
+}
+
+func (runner *TestSuiteRunner) generalError(msg string, err error) error {
+	var diags tfdiags.Diagnostics
+
+	if urlErr, ok := err.(*url.Error); ok {
+		err = urlErr.Err
+	}
+
+	switch err {
+	case context.Canceled:
+		return err
+	case tfe.ErrResourceNotFound:
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			fmt.Sprintf("%s: %v", msg, err),
+			fmt.Sprintf("For security, %s return '404 Not Found' responses for resources\n", runner.appName)+
+				"for resources that a user doesn't have access to, in addition to resources that\n"+
+				"do not exist. If the resource does exist, please check the permissions of the provided token.",
+		))
+		return diags.Err()
+	default:
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			fmt.Sprintf("%s: %v", msg, err),
+			fmt.Sprintf(`%s returned an unexpected error. Sometimes `, runner.appName)+
+				`this is caused by network connection problems, in which case you could retry `+
+				`the command. If the issue persists please open a support ticket to get help `+
+				`resolving the problem.`,
+		))
+		return diags.Err()
+	}
 }

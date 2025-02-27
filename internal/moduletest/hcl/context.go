@@ -10,11 +10,17 @@ import (
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/addrs"
-	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/lang"
-	"github.com/hashicorp/terraform/internal/lang/marks"
-	"github.com/hashicorp/terraform/internal/terraform"
+	"github.com/hashicorp/terraform/internal/lang/langrefs"
 	"github.com/hashicorp/terraform/internal/tfdiags"
+)
+
+type EvalContextTarget string
+
+const (
+	TargetRunBlock     EvalContextTarget = "run"
+	TargetProvider     EvalContextTarget = "provider"
+	TargetFileVariable EvalContextTarget = "file"
 )
 
 // EvalContext builds hcl.EvalContext objects for use directly within the
@@ -39,100 +45,65 @@ import (
 // expressions to be evaluated will pass evaluation. Anything present in the
 // expressions argument will be validated to make sure the only reference the
 // availableVariables and availableRunBlocks.
-func EvalContext(expressions []hcl.Expression, availableVariables map[string]cty.Value, availableRunBlocks map[string]*terraform.TestContext) (*hcl.EvalContext, tfdiags.Diagnostics) {
+//
+// We perform some pre-validation of the expected expressions that this context
+// will be used to evaluate. This is just so we can provide some better error
+// messages and diagnostics. The expressions argument could be empty without
+// affecting the returned context.
+func EvalContext(target EvalContextTarget, expressions map[string]hcl.Expression, availableVariables map[string]cty.Value, availableRunOutputs map[addrs.Run]cty.Value) (*hcl.EvalContext, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
-	runs := make(map[string]cty.Value)
-	for name, ctx := range availableRunBlocks {
-		if ctx == nil {
-			// Then this is a valid run block, but it hasn't executed yet so we
-			// won't take any values from it.
-			continue
-		}
-		outputs := make(map[string]cty.Value)
-		for name, config := range ctx.Config.Module.Outputs {
-			output := ctx.State.OutputValue(addrs.AbsOutputValue{
-				OutputValue: addrs.OutputValue{
-					Name: name,
-				},
-				Module: addrs.RootModuleInstance,
-			})
-
-			var value cty.Value
-			switch {
-			case output == nil:
-				// This means the run block returned null for this output.
-				// It is likely this will produce an error later if it is
-				// referenced, but users can actually specify that null
-				// is an acceptable value for an input variable so we won't
-				// actually raise a fuss about this at all.
-				value = cty.NullVal(cty.DynamicPseudoType)
-			case output.Value.IsNull() || output.Value == cty.NilVal:
-				// This means the output value was returned as (known after
-				// apply). If this is referenced it always an error, we
-				// can't handle this in an appropriate way at all. For now,
-				// we just mark it as unknown and then later we check and
-				// resolve all the references. We'll raise an error at that
-				// point if the user actually attempts to reference a value
-				// that is unknown.
-				value = cty.DynamicVal
-			default:
-				value = output.Value
-			}
-
-			if config.Sensitive || (output != nil && output.Sensitive) {
-				value = value.Mark(marks.Sensitive)
-			}
-
-			outputs[name] = value
-		}
-
-		runs[name] = cty.ObjectVal(outputs)
+	runs := make(map[string]cty.Value, len(availableRunOutputs))
+	for addr, objVal := range availableRunOutputs {
+		runs[addr.Name] = objVal
 	}
 
 	for _, expression := range expressions {
-		refs, refDiags := lang.ReferencesInExpr(addrs.ParseRefFromTestingScope, expression)
+		refs, refDiags := langrefs.ReferencesInExpr(addrs.ParseRefFromTestingScope, expression)
 		diags = diags.Append(refDiags)
 
 		for _, ref := range refs {
 			if addr, ok := ref.Subject.(addrs.Run); ok {
-
-				if availableRunBlocks == nil {
-					// Then run blocks are never available from this context.
+				if target == TargetFileVariable {
+					// You can't reference run blocks from within the file
+					// variables block.
 					diags = diags.Append(&hcl.Diagnostic{
 						Severity: hcl.DiagError,
 						Summary:  "Invalid reference",
-						Detail:   "You cannot reference run blocks from within provider configurations. You can only reference run blocks from other run blocks that execute after them.",
+						Detail:   "You can not reference run blocks from within the file variables block.",
 						Subject:  ref.SourceRange.ToHCL().Ptr(),
 					})
-
 					continue
 				}
 
-				// For the error messages here, we know the reference is coming
-				// from a run block as that is the only place that reference
-				// other run blocks.
+				objVal, exists := availableRunOutputs[addr]
 
-				ctx, exists := availableRunBlocks[addr.Name]
+				var diagPrefix string
+				switch target {
+				case TargetRunBlock:
+					diagPrefix = "You can only reference run blocks that are in the same test file and will execute before the current run block."
+				case TargetProvider:
+					diagPrefix = "You can only reference run blocks that are in the same test file and will execute before the provider is required."
+				}
 
 				if !exists {
 					// Then this is a made up run block.
 					diags = diags.Append(&hcl.Diagnostic{
 						Severity: hcl.DiagError,
 						Summary:  "Reference to unknown run block",
-						Detail:   fmt.Sprintf("The run block %q does not exist within this test file. You can only reference run blocks that are in the same test file and will execute before the current run block.", addr.Name),
+						Detail:   fmt.Sprintf("The run block %q does not exist within this test file. %s", addr.Name, diagPrefix),
 						Subject:  ref.SourceRange.ToHCL().Ptr(),
 					})
 
 					continue
 				}
 
-				if ctx == nil {
+				if objVal == cty.NilVal {
 					// This run block exists, but it is after the current run block.
 					diags = diags.Append(&hcl.Diagnostic{
 						Severity: hcl.DiagError,
 						Summary:  "Reference to unavailable run block",
-						Detail:   fmt.Sprintf("The run block %q is not available to the current run block. You can only reference run blocks that are in the same test file and will execute before the current run block.", addr.Name),
+						Detail:   fmt.Sprintf("The run block %q has not executed yet. %s", addr.Name, diagPrefix),
 						Subject:  ref.SourceRange.ToHCL().Ptr(),
 					})
 
@@ -152,30 +123,20 @@ func EvalContext(expressions []hcl.Expression, availableVariables map[string]cty
 					// This is not valid, we cannot allow users to pass unknown
 					// values into run blocks. There's just going to be
 					// difficult and confusing errors later if this happens.
-
-					if ctx.Run.Config.Command == configs.PlanTestCommand {
-						// Then the user has likely attempted to use an output
-						// that is (known after apply) due to the referenced
-						// run block only being a plan command.
-						diags = diags.Append(&hcl.Diagnostic{
-							Severity: hcl.DiagError,
-							Summary:  "Reference to unknown value",
-							Detail:   fmt.Sprintf("The value for %s is unknown. Run block %q is executing a \"plan\" operation, and the specified output value is only known after apply.", ref.DisplayString(), addr.Name),
-							Subject:  ref.SourceRange.ToHCL().Ptr(),
-						})
-
-						continue
-					}
-
-					// Otherwise, this is a bug in Terraform. We shouldn't be
-					// producing (known after apply) values during apply
-					// operations.
+					//
+					// When reporting this we assume that it's happened because
+					// the prior run was a plan-only run and that some of its
+					// output values were not known. If this arises for a
+					// run that performed a full apply then this is a bug in
+					// Terraform's modules runtime, because unknown output
+					// values should not be possible in that case.
 					diags = diags.Append(&hcl.Diagnostic{
 						Severity: hcl.DiagError,
 						Summary:  "Reference to unknown value",
-						Detail:   fmt.Sprintf("The value for %s is unknown; This is a bug in Terraform, please report it.", ref.DisplayString()),
+						Detail:   fmt.Sprintf("The value for %s is unknown. Run block %q is executing a \"plan\" operation, and the specified output value is only known after apply.", ref.DisplayString(), addr.Name),
 						Subject:  ref.SourceRange.ToHCL().Ptr(),
 					})
+					continue
 				}
 
 				continue
@@ -185,9 +146,14 @@ func EvalContext(expressions []hcl.Expression, availableVariables map[string]cty
 				if _, exists := availableVariables[addr.Name]; !exists {
 					// This variable reference doesn't exist.
 
-					detail := fmt.Sprintf("The input variable %q is not available to the current run block. You can only reference variables defined at the file or global levels when populating the variables block within a run block.", addr.Name)
-					if availableRunBlocks == nil {
-						detail = fmt.Sprintf("The input variable %q is not available to the current provider configuration. You can only reference variables defined at the file or global levels within provider configurations.", addr.Name)
+					var detail string
+					switch target {
+					case TargetRunBlock:
+						detail = fmt.Sprintf("The input variable %q is not available to the current run block. You can only reference variables defined at the file or global levels.", addr.Name)
+					case TargetProvider:
+						detail = fmt.Sprintf("The input variable %q is not available to the current provider configuration. You can only reference variables defined at the file or global levels.", addr.Name)
+					case TargetFileVariable:
+						detail = fmt.Sprintf("The input variable %q is not available to the current context. You can only reference global variables.", addr.Name)
 					}
 
 					diags = diags.Append(&hcl.Diagnostic{
@@ -204,9 +170,14 @@ func EvalContext(expressions []hcl.Expression, availableVariables map[string]cty
 				continue
 			}
 
-			detail := "You can only reference earlier run blocks, file level, and global variables while defining variables from inside a run block."
-			if availableRunBlocks == nil {
-				detail = "You can only reference file level and global variables from inside provider configurations within test files."
+			var detail string
+			switch target {
+			case TargetRunBlock:
+				detail = "You can only reference earlier run blocks, file level, and global variables while defining variables from inside a run block."
+			case TargetProvider:
+				detail = "You can only reference run blocks, file level, and global variables while defining variables from inside provider configurations."
+			case TargetFileVariable:
+				detail = "You can only reference global variables within the test file variables block."
 			}
 
 			// You can only reference run blocks and variables from the run
@@ -224,10 +195,11 @@ func EvalContext(expressions []hcl.Expression, availableVariables map[string]cty
 		Variables: func() map[string]cty.Value {
 			variables := make(map[string]cty.Value)
 			variables["var"] = cty.ObjectVal(availableVariables)
-			if availableRunBlocks != nil {
+			if availableRunOutputs != nil {
 				variables["run"] = cty.ObjectVal(runs)
 			}
 			return variables
 		}(),
+		Functions: lang.TestingFunctions(),
 	}, diags
 }
